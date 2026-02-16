@@ -43,15 +43,6 @@ pyinstaller --noconsole --onefile --name NP2 main.py
 ```
 The executable will be located in the `dist/` folder.
 
-## Creating a Release (GitHub)
-To publish a release manually:
-1. Go to your repository on GitHub.
-2. Click **Releases** in the sidebar.
-3. Click **Draft a new release**.
-4. create a new tag (e.g., `v1.0.0`).
-5. Upload the files from `dist/` (`NP2.exe` and the `.zip` archive).
-6. Click **Publish release**.
-
 ## Project Structure
 - `main.py`: Entry point.
 - `editor/`: core editor components (`text_editor.py`, `app.py`, `tab_manager.py`).
