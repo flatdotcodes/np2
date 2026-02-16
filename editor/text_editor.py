@@ -38,17 +38,31 @@ class LineNumbers(tk.Canvas):
         """Redraw line numbers."""
         self.delete('all')
         
-        # Get visible line range
-        first_visible = self.text_widget.index('@0,0')
-        last_visible = self.text_widget.index(f'@0,{self.text_widget.winfo_height()}')
+        # Get total lines - for single-line files, skip expensive calculations
+        total_index = self.text_widget.index('end-1c')
+        total_lines = int(total_index.split('.')[0])
         
-        first_line = int(first_visible.split('.')[0])
-        last_line = int(last_visible.split('.')[0])
-        
-        # Get total lines for width calculation
-        total_lines = int(self.text_widget.index('end-1c').split('.')[0])
+        # Width calculation
         width = max(len(str(total_lines)) * 10 + 20, 50)
         self.configure(width=width)
+        
+        # Single-line optimization: Don't call dlineinfo for huge single lines
+        if total_lines == 1:
+            # Just draw "1" at a fixed position
+            self.create_text(width - 10, 5, anchor='ne', text='1', 
+                           font=self.font, fill=self.fg_color)
+            if 1 in self.lint_markers:
+                self.create_oval(5, 7, 10, 12, fill=self.lint_markers[1], outline=self.lint_markers[1])
+            return
+        
+        # Multi-line: use yview optimization
+        try:
+            top, bottom = self.text_widget.yview()
+            first_line = max(1, int(top * total_lines))
+            last_line = min(total_lines, int(bottom * total_lines) + 2)
+        except Exception:
+            first_line = 1
+            last_line = 1
         
         # Draw line numbers
         for line_num in range(first_line, last_line + 1):
@@ -56,25 +70,11 @@ class LineNumbers(tk.Canvas):
                 dline_info = self.text_widget.dlineinfo(f'{line_num}.0')
                 if dline_info:
                     y = dline_info[1]
-                    
-                    # Draw lint marker if present
                     if line_num in self.lint_markers:
-                        color = self.lint_markers[line_num]
-                        # Draw small circle
-                        self.create_oval(
-                            5, y + 5, 10, y + 10,
-                            fill=color,
-                            outline=color
-                        )
-                    
-                    self.create_text(
-                        width - 10,
-                        y,
-                        anchor='ne',
-                        text=str(line_num),
-                        font=self.font,
-                        fill=self.fg_color
-                    )
+                        self.create_oval(5, y + 5, 10, y + 10,
+                            fill=self.lint_markers[line_num], outline=self.lint_markers[line_num])
+                    self.create_text(width - 10, y, anchor='ne', text=str(line_num),
+                        font=self.font, fill=self.fg_color)
             except Exception:
                 pass
     
@@ -216,6 +216,17 @@ class TextEditor(tk.Frame):
         
         # Apply initial theme
         self._apply_theme()
+        
+        # Settings - Load from Manager to ensure correct initial state
+        try:
+            from utils.settings import SettingsManager
+            settings = SettingsManager().settings
+            self.highlight_occurrences_enabled = settings.highlight_occurrences
+            self.set_word_wrap(settings.word_wrap)
+            self.theme = settings.theme # Theme is applied above but store it
+        except Exception:
+            self.highlight_occurrences_enabled = True
+
     
     def _setup_bindings(self):
         """Set up event bindings."""
@@ -224,15 +235,21 @@ class TextEditor(tk.Frame):
         self.text.bind('<KeyRelease>', self._on_key_release, add='+')
         self.text.bind('<ButtonRelease-1>', self._on_click)
         
-        # Scroll sync for line numbers
-        self.text.bind('<Configure>', lambda e: self.line_numbers.redraw())
-        self.text.bind('<MouseWheel>', lambda e: self.after(1, self.line_numbers.redraw))
+        # Scroll sync for line numbers - debounced to prevent lag
+        self.text.bind('<Configure>', lambda e: self._debounced_redraw())
+        self.text.bind('<MouseWheel>', lambda e: self._debounced_redraw())
         self.text.bind('<<Selection>>', self._on_selection_change)
+    
+    def _debounced_redraw(self):
+        """Debounce line number redraws to prevent scroll lag."""
+        if hasattr(self, '_redraw_job') and self._redraw_job:
+            self.after_cancel(self._redraw_job)
+        self._redraw_job = self.after(16, self.line_numbers.redraw)  # ~60fps max
     
     def _on_scroll(self, *args):
         """Handle scroll events."""
         self.v_scroll.set(*args)
-        self.line_numbers.redraw()
+        self._debounced_redraw()
     
     def _on_modified(self, event=None):
         """Handle modification events."""
@@ -261,21 +278,43 @@ class TextEditor(tk.Frame):
     
     def _on_selection_change(self, event=None):
         """Handle selection change - highlight occurrences when text is selected."""
+        # Skip expensive operations in performance mode
+        if getattr(self, '_performance_mode', False):
+            return
+            
         self._highlight_current_line()
         
         # Debounce selection changes
         if hasattr(self, '_selection_job') and self._selection_job:
             self.after_cancel(self._selection_job)
         self._selection_job = self.after(150, self._check_selection)
+        
+        # Log selection change time
+        import time
+        self._log_method('_on_selection_change', time.time())
     
+    def set_highlight_occurrences(self, enabled):
+        """Enable or disable occurrence highlighting."""
+        self.highlight_occurrences_enabled = enabled
+        if not enabled:
+            self._maybe_clear_occurrences()
+            
     def _check_selection(self):
         """Check current selection and highlight occurrences."""
+        # Skip in performance mode
+        if getattr(self, '_performance_mode', False):
+            return
+            
+        # Check if enabled (default to True if attribute missing for backward compat)
+        if not getattr(self, 'highlight_occurrences_enabled', True):
+            return
+            
         try:
             sel_start = self.text.index('sel.first')
             sel_end = self.text.index('sel.last')
             selected = self.text.get(sel_start, sel_end).strip()
             
-            if selected and len(selected) > 1:
+            if selected and len(selected) > 1 and len(selected) <= 50:
                 self.highlight_all_occurrences(selected)
             else:
                 self._maybe_clear_occurrences()
@@ -325,10 +364,26 @@ class TextEditor(tk.Frame):
     
     def _update_highlighting(self):
         """Update syntax highlighting for visible region."""
+        import time
+        t_start = time.time()
         try:
-            first_visible = self.text.index('@0,0')
-            last_visible = self.text.index(f'@0,{self.text.winfo_height()}')
-            self.highlighter.highlight_region(first_visible, last_visible)
+            # Optimization: Use yview for fractional position to avoid expensive pixel calculations
+            # index('@0,0') forces layout calculation which lags on long lines
+            top, bottom = self.text.yview()
+            
+            # Get total lines efficiently
+            # using 'end-1c' index parsing is fast
+            total_index = self.text.index('end-1c')
+            total_lines = int(total_index.split('.')[0])
+            
+            # Calculate visible line range
+            # Add small buffer to ensure coverage
+            start_line = max(1, int(top * total_lines))
+            end_line = min(total_lines, int(bottom * total_lines) + 2)
+            
+            self.highlighter.highlight_region(f"{start_line}.0", f"{end_line}.0")
+            
+            self._log_method('_update_highlighting', t_start)
         except Exception:
             pass
     
@@ -371,8 +426,47 @@ class TextEditor(tk.Frame):
             self.language = detect_language(filepath, content)
             self.highlighter.set_language(self.language)
         
-        # Apply highlighting
-        self.highlighter.highlight_all()
+        # Performance check: Huge single lines
+        # Tkinter is fundamentally slow with very long lines (both wrap modes).
+        # We enter "performance mode" which disables expensive features.
+        self._performance_mode = False
+        try:
+            scan_content = content[:1000000]
+            if scan_content:
+                lines = scan_content.splitlines()
+                max_line = max(len(line) for line in lines) if lines else 0
+                
+                # If any line > 4000 chars, enter performance mode
+                if max_line > 4000:
+                    self._performance_mode = True
+                    
+                    # Disable all expensive features
+                    self.set_word_wrap(False)  # No wrap = simpler layout
+                    self.highlight_occurrences_enabled = False
+                    self.autocomplete.set_enabled(False)
+                    
+                    # Clear any existing highlights to prevent lag
+                    self.text.tag_remove('current_line', '1.0', 'end')
+                    self.clear_occurrence_highlights()
+                    
+                    # Show user message
+                    from tkinter import messagebox
+                    messagebox.showwarning(
+                        "Performance Mode Enabled",
+                        f"This file contains a line with {max_line:,} characters.\n\n"
+                        "To ensure the editor remains responsive, some features have been disabled:\n"
+                        "• Syntax highlighting\n"
+                        "• Occurrence highlighting\n"
+                        "• Autocomplete\n"
+                        "• Current line highlighting\n\n"
+                        "The file remains fully editable. For best results, consider reformatting with line breaks."
+                    )
+        except Exception:
+            pass
+        
+        # Apply highlighting (skip in performance mode)
+        if not self._performance_mode:
+            self.highlighter.highlight_all()
         self.line_numbers.redraw()
     
     def get_content(self):
@@ -414,15 +508,16 @@ class TextEditor(tk.Frame):
         self.current_occurrence_index = -1
         self.highlighted_word = text
         
-        if not text or not self.occurrence_highlight_enabled:
+        if not text or not self.occurrence_highlight_enabled or len(text) > 100:
             self._hide_occurrence_bar()
             return 0
         
         # Find and highlight all occurrences
         start = '1.0'
         count = 0
+        max_matches = 100 # Performance limit
         
-        while True:
+        while count < max_matches:
             pos = self.text.search(text, start, stopindex='end', nocase=True)
             if not pos:
                 break
@@ -524,6 +619,10 @@ class TextEditor(tk.Frame):
         
     def _highlight_current_line(self):
         """Highlight the current line."""
+        # Skip in performance mode
+        if getattr(self, '_performance_mode', False):
+            return
+            
         # Remove existing highlight
         self.text.tag_remove(self.current_line_tag, '1.0', 'end')
         
@@ -533,9 +632,18 @@ class TextEditor(tk.Frame):
             line = int(line_str)
             start = f'{line}.0'
             end = f'{line + 1}.0'
+            # Optimization: Skip if line is too long (prevents lag on massive lines)
+            # Use 'count' to get line length efficiently
+            count = self.text.count(start, f'{line}.end', 'chars')
+            if count and count[0] > 4000:
+                return
+
             self.text.tag_add(self.current_line_tag, start, end)
         except Exception:
             pass
+            
+    def _log_method(self, name, start):
+        pass
     
     def find_text(self, text, case_sensitive=False, whole_word=False, regex=False, start=None):
         """
@@ -755,3 +863,26 @@ class TextEditor(tk.Frame):
         if hasattr(self, 'autocomplete'):
             self.autocomplete.destroy()
         super().destroy()
+
+    def get_cursor_position(self):
+        """Return current cursor position as (line, col)."""
+        pos = self.text.index('insert')
+        line, col = pos.split('.')
+        return int(line), int(col)
+
+    def set_cursor_position(self, pos):
+        """Set cursor position (accepts 'line.col' or (line, col))."""
+        try:
+            # Convert tuple/list to string format if needed
+            if isinstance(pos, (tuple, list)):
+                pos = f"{pos[0]}.{pos[1]}"
+                
+            self.text.mark_set('insert', pos)
+            # Ensure start of line is visible first (prevents unnecessary right shift)
+            self.text.see(f"{pos} linestart")
+            # Force horizontal scroll to left
+            self.text.xview_moveto(0)
+            self.text.see(pos)
+            self._highlight_current_line()
+        except tk.TclError:
+            pass

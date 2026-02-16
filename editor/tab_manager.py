@@ -131,6 +131,12 @@ class TabManager(ttk.Notebook):
         if not editor: return False
         
         if editor.filepath:
+            # Check if file was deleted externally
+            if not os.path.exists(editor.filepath):
+                msg = f"The file '{os.path.basename(editor.filepath)}' no longer exists on disk.\nDo you want to save it as a new file?"
+                if not messagebox.askyesno("File Deleted", msg):
+                    return False
+
             try:
                 write_file(editor.filepath, editor.get_content(), editor.encoding)
                 editor.mark_saved()
@@ -201,27 +207,103 @@ class TabManager(ttk.Notebook):
             pass
 
     def get_session_data(self):
-        """Return list of open file paths."""
+        """Return list of open tabs with state (filepath, cursor, draft content)."""
         data = []
+        
+        # Ensure drafts dir exists
+        if not os.path.exists(DRAFTS_DIR):
+            os.makedirs(DRAFTS_DIR)
+            
         for tab_id in self.tabs():
              editor = self.editors.get(tab_id)
-             if editor and editor.filepath:
-                 data.append(editor.filepath)
+             if not editor: continue
+             
+             state = {
+                 'filepath': editor.filepath,
+                 'cursor': editor.get_cursor_position(),
+                 'title': self.tab(tab_id, 'text').rstrip('*') 
+             }
+             
+             # Save unsaved content to draft (Hot Exit)
+             # Save draft if modified, regardless of whether it has a filepath
+             if editor.modified:
+                 draft_name = f"draft_{abs(hash(tab_id))}.txt"
+                 draft_path = os.path.join(DRAFTS_DIR, draft_name)
+                 try:
+                     with open(draft_path, 'w', encoding='utf-8') as f:
+                         f.write(editor.get_content())
+                     state['draft_path'] = draft_path
+                     state['modified'] = True
+                 except Exception as e:
+                     print(f"Error saving draft: {e}")
+             
+             data.append(state)
         return data
 
-    def restore_session(self, file_paths):
-        """Restore tabs from file paths."""
-        for item in file_paths:
-            # Handle legacy session data (might be dict with metadata)
-            path = item
-            if isinstance(item, dict):
-                path = item.get('path') or item.get('filepath')
+    def restore_session(self, session_data):
+        """Restore tabs from session data."""
+        # Handle legacy list-of-strings format
+        if not session_data: return
+
+        for item in session_data:
+            path = None
+            draft_path = None
+            cursor = None
+            is_modified = False
+            title = None
+            
+            if isinstance(item, str):
+                path = item
+            elif isinstance(item, dict):
+                path = item.get('filepath') or item.get('path')
+                draft_path = item.get('draft_path')
+                cursor = item.get('cursor')
+                is_modified = item.get('modified', False)
+                title = item.get('title')
                 
-            if path and isinstance(path, str) and os.path.exists(path):
+            editor = None
+            # 1. Try to load file
+            if path and os.path.exists(path):
                 try:
-                    self.new_tab(path)
+                    editor = self.new_tab(path)
                 except Exception as e:
-                    print(f"Error restoring tab: {e}")
+                    print(f"Error restoring tab {path}: {e}")
+            
+            # 2. Try to load draft (Untitled/Unsaved OR Hot Exit)
+            # Check draft_path separately to overwrite file content if modified
+            if draft_path and os.path.exists(draft_path):
+                try:
+                    with open(draft_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    if editor:
+                         # Overwrite content of opened file (Hot Exit)
+                         # We set filepath again to be safe, but new_tab already set it
+                         editor.set_content(content, path) 
+                    else:
+                         # Restore untitled tab
+                         editor = self.new_tab(content=content)
+                    
+                    if title:
+                        self.tab(editor, text=title)
+                    
+                    if is_modified:
+                        editor.modified = True
+                        editor.text.edit_modified(True)
+                        self._update_tab_title(str(editor))
+                except Exception as e:
+                    print(f"Error restoring draft: {e}")
+            elif not editor and path: 
+                 # File missing, draft missing. 
+                 # We tried new_tab(path) above. If that failed, we have nothing.
+                 pass
+            
+            # 3. Restore cursor (Snap to line start for better view stability)
+            if editor and cursor:
+                if isinstance(cursor, (list, tuple)) and len(cursor) >= 1:
+                    editor.set_cursor_position((cursor[0], 0))
+                else:
+                    editor.set_cursor_position(cursor)
 
     def get_current_editor(self):
         current = self.select()

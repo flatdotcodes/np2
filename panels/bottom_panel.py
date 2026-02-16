@@ -285,6 +285,10 @@ class BottomPanel(ttk.Frame):
         """Focus the input field."""
         self.input.focus_set()
         self.notebook.select(0)  # Switch to terminal tab
+
+    def set_working_directory(self, path):
+        """Set the terminal working directory."""
+        self._change_directory(path)
     
     # Problems methods
     def show_lint_results(self, errors, filepath=None):

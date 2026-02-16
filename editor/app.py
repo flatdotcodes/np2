@@ -231,7 +231,7 @@ class NP2App:
         self.linter = Linter(on_results=self._on_lint_results)
         
         # Bind tab change event
-        self.tab_manager.bind('<<TabChanged>>', self._on_tab_changed)
+        self.tab_manager.bind('<<NotebookTabChanged>>', self._on_tab_changed)
     
     def _setup_status_bar(self):
         """Set up the status bar."""
@@ -519,21 +519,39 @@ class NP2App:
         if not editor:
             return
         
-        # Save file first if needed
+        # Use temp file for linting to avoid auto-saving user's file
         if editor.filepath:
-            if editor.modified:
-                self.tab_manager.save_tab()
+            # Create temp dir if needed
+            temp_dir = os.path.join(os.path.expanduser('~'), '.np2', 'temp')
+            os.makedirs(temp_dir, exist_ok=True)
             
-            # Store filepath for callback
-            self._lint_filepath = editor.filepath
+            # Create temp file with same extension as original (to help linter)
+            ext = os.path.splitext(editor.filepath)[1]
+            temp_filename = f"lint_temp_{os.path.basename(editor.filepath)}"
+            temp_path = os.path.join(temp_dir, temp_filename)
             
-            # Run linter
-            self.linter.lint_file(editor.filepath, editor.language)
-            
-            # Show feedback
-            self.status_file.configure(text=f'Linting {os.path.basename(editor.filepath)}...')
+            try:
+                # Write current content to temp file
+                with open(temp_path, 'w', encoding=editor.encoding) as f:
+                    f.write(editor.get_content())
+                
+                # Store ORIGINAL filepath for callback (so markers are applied to editor)
+                self._lint_filepath = editor.filepath
+                
+                # Run linter on temp file, but with ORIGINAL CWD (for imports)
+                self.linter.lint_file(
+                    temp_path, 
+                    editor.language, 
+                    cwd=os.path.dirname(editor.filepath)
+                )
+                
+                # Show feedback
+                self.status_file.configure(text=f'Linting {os.path.basename(editor.filepath)}...')
+                
+            except Exception as e:
+                print(f"Lint error: {e}")
         else:
-             # Can't lint untitled files with this implementation
+             # Can't lint untitled files easily (no import context)
              pass
     
     def _on_lint_results(self, errors):
@@ -606,6 +624,10 @@ class NP2App:
             self.find_dialog.set_editor(editor)
             self.current_lang_var.set(editor.language)  # Sync language menu
             self._update_status()
+            
+            # Sync terminal if enabled
+            if self.settings.terminal_follow and editor.filepath:
+                self.bottom_panel.set_working_directory(os.path.dirname(editor.filepath))
     
     def _update_status(self, event=None):
         """Update status bar."""
@@ -673,7 +695,7 @@ class NP2App:
             
     def _on_file_modified(self, event=None):
         """Handle file modification for auto-save."""
-        if self.settings.autosave_mode == 'change':
+        if self.settings.autosave_mode.lower() == 'change':
             # Save current tab if modified
             editor = self.tab_manager.get_current_editor()
             if editor and editor.filepath and editor.modified:
@@ -686,13 +708,18 @@ class NP2App:
             self.root.after_cancel(self._autosave_timer)
             self._autosave_timer = None
             
-        if self.settings.autosave_mode == 'interval':
-            interval_ms = self.settings.autosave_interval * 1000
-            self._autosave_timer = self.root.after(interval_ms, self._check_autosave)
+        mode = self.settings.autosave_mode.lower()
+        if mode == 'interval':
+            try:
+                interval_ms = int(self.settings.autosave_interval) * 1000
+                if interval_ms > 0:
+                    self._autosave_timer = self.root.after(interval_ms, self._check_autosave)
+            except (ValueError, TypeError):
+                pass # Invalid interval
             
     def _check_autosave(self):
         """Check and perform auto-save."""
-        if self.settings.autosave_mode == 'interval':
+        if self.settings.autosave_mode.lower() == 'interval':
             # Save all modified files that have a path
             for tab_id in self.tab_manager.tabs():
                 editor = self.tab_manager.editors.get(tab_id)
@@ -736,6 +763,15 @@ class NP2App:
         self.root.geometry(self.settings.window_geometry)
         
         self.occurrence_highlight_var.set(self.settings.highlight_occurrences)
+        
+        # Update all editors
+        if hasattr(self, 'tab_manager'):
+            for tab_id in self.tab_manager.tabs():
+                editor = self.tab_manager.editors.get(tab_id)
+                if editor:
+                    editor.set_word_wrap(self.settings.word_wrap)
+                    editor.set_highlight_occurrences(self.settings.highlight_occurrences)
+                    # Theme is handled by _set_theme below
         
         # Toggle panels based on settings
         if not self.show_workspace:

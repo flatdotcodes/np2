@@ -191,12 +191,21 @@ class SyntaxHighlighter:
         line_start = self.text_widget.index(f'{start} linestart')
         line_end = self.text_widget.index(f'{end} lineend')
         
+        # Content too large for regex highlighting?
+        # Get content first (fix for UnboundLocalError)
         content = self.text_widget.get(line_start, line_end)
         
+        if len(content) > 4000:
+             return
+             
         # Remove old tags in region
         for token_type in self.theme:
             if not isinstance(token_type, str):
                 self.text_widget.tag_remove(str(token_type), line_start, line_end)
+
+        # Optimization: Skip highlighting for very long lines to prevent lag
+        if len(content) > 4000:
+            return
         
         # Apply new highlighting
         self._apply_highlighting(content, line_start)

@@ -182,6 +182,10 @@ class FindReplaceDialog:
     
     def _on_find_change(self, event=None):
         """Handle changes to find text."""
+        # Ignore Return key release (fixes highlight disappearing)
+        if event and event.keysym in ('Return', 'KP_Enter'):
+            return
+            
         # Clear highlights when text changes
         self.editor.clear_search_highlights()
         self.status_label.configure(text='')

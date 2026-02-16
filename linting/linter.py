@@ -59,13 +59,14 @@ class Linter:
         self.current_process = None
         self.errors: List[LintError] = []
     
-    def lint_file(self, filepath, language='python'):
+    def lint_file(self, filepath, language='python', cwd=None):
         """
         Run linting on a file.
         
         Args:
             filepath: Path to file
             language: Programming language
+            cwd: Working directory (optional, defaults to file dir)
         """
         # Get linter config
         config = self.LINTERS.get(language)
@@ -78,16 +79,20 @@ class Linter:
         # Run linting in background
         thread = threading.Thread(
             target=self._run_linter,
-            args=(filepath, config),
+            args=(filepath, config, cwd),
             daemon=True
         )
         thread.start()
     
-    def _run_linter(self, filepath, config):
+    def _run_linter(self, filepath, config, cwd=None):
         """Run linter in background thread."""
         try:
             # Build command
             command = config['command'] + [filepath]
+            
+            # Determine CWD
+            if cwd is None:
+                cwd = os.path.dirname(filepath)
             
             # Run linter
             self.current_process = subprocess.Popen(
@@ -95,7 +100,7 @@ class Linter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd=os.path.dirname(filepath),
+                cwd=cwd,
             )
             
             stdout, stderr = self.current_process.communicate(timeout=30)

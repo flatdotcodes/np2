@@ -32,14 +32,27 @@ class AutoComplete:
     
     def _build_word_list(self):
         """Build word list from document content."""
+        # Optimization: Don't scan huge files
+        if self.text_widget.index('end-1c') == '1.0':
+            return
+
+        # Skip if file is too large (causes CPU spikes)
         content = self.text_widget.get('1.0', 'end-1c')
+        if len(content) > 50000:  # 50k char limit
+            self.words = set()  # Clear words for large files
+            return
         
         # Extract words (alphanumeric and underscores)
         pattern = r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'
         matches = re.findall(pattern, content)
         
-        # Filter by minimum length
-        self.words = {w for w in matches if len(w) >= self.min_word_length}
+        # Limit word count to prevent slow operations
+        unique_words = {w for w in matches if len(w) >= self.min_word_length}
+        if len(unique_words) > 1000:
+            # Take first 1000 to avoid processing overhead
+            self.words = set(list(unique_words)[:1000])
+        else:
+            self.words = unique_words
     
     def _get_current_word(self):
         """Get the word currently being typed."""
@@ -76,7 +89,7 @@ class AutoComplete:
         if not self.enabled:
             return
         
-        # Ignore certain keys
+        # Ignore navigation keys
         ignore_keys = {'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 
                        'Alt_L', 'Alt_R', 'Escape', 'Return', 'Tab',
                        'Up', 'Down', 'Left', 'Right', 'Home', 'End',
@@ -86,20 +99,33 @@ class AutoComplete:
             if event.keysym == 'Escape':
                 self._hide_popup()
             return
-        
-        # Rebuild word list
-        self._build_word_list()
-        
-        # Get current word
+
+        # Get current word immediately to decide if we should show suggestions
         current_word = self._get_current_word()
-        
         if not current_word or len(current_word) < self.min_prefix_length:
             self._hide_popup()
             return
+            
+        # Debounce word list rebuilding (heavy operation)
+        if hasattr(self, '_build_job') and self._build_job:
+            self.text_widget.after_cancel(self._build_job)
+        self._build_job = self.text_widget.after(300, lambda: self._update_suggestions(current_word))
+
+    def _update_suggestions(self, current_word):
+        """Build word list and show suggestions."""
+        self._build_word_list()
         
-        # Get suggestions
-        suggestions = self._get_suggestions(current_word)
+        # Re-check current word (might have changed? No, we use the one from trigger time?
+        # Actually better to re-get current word to be safe, or use passed one if valid.
+        # But cursor might have moved. Let's start with rebuild.
         
+        # Get suggestions based on CURRENT word at cursor (user might have typed more)
+        real_current = self._get_current_word()
+        if not real_current or len(real_current) < self.min_prefix_length:
+            self._hide_popup()
+            return
+
+        suggestions = self._get_suggestions(real_current)
         if suggestions:
             self._show_popup(suggestions)
         else:
